@@ -143,6 +143,8 @@ class H3TimestepRows:
     block_segments: tuple[tuple[tuple[int, int, int], ...], ...]
     video_timestep_index: int
     audio_timestep_index: int
+    video_timestep_indices: torch.Tensor
+    audio_timestep_indices: torch.Tensor
 
 
 def _coerce_video_geometry(value: H3VideoGeometry | Sequence[int], label: str) -> H3VideoGeometry:
@@ -408,6 +410,28 @@ def _build_modulation_segments(indices: torch.Tensor) -> tuple[tuple[int, int, i
     )
 
 
+def _validate_target_denoise_rows(mask: torch.Tensor | None, row_count: int, label: str) -> torch.Tensor:
+    if mask is None:
+        return torch.ones((1, row_count), dtype=torch.bool)
+    mask = torch.as_tensor(mask).detach().cpu()
+    if mask.shape != (1, row_count):
+        raise ValueError(f"MiniMax-H3 {label} must be [1,{row_count}], got {tuple(mask.shape)}")
+    if mask.is_floating_point() and not torch.isfinite(mask).all():
+        raise ValueError(f"MiniMax-H3 {label} must be finite")
+    if not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError(f"MiniMax-H3 {label} must contain only 0 (fixed) and 1 (regenerate)")
+    return mask.to(torch.bool)
+
+
+def _timestep_index(unique_timesteps: torch.Tensor, value: float, label: str, *, fallback: int) -> int:
+    matches = torch.nonzero(unique_timesteps == torch.tensor(value, dtype=unique_timesteps.dtype), as_tuple=False)
+    if matches.numel() == 0:
+        return fallback
+    if matches.shape != (1, 1):
+        raise RuntimeError(f"MiniMax-H3 {label} timestep is missing from the packed plan")
+    return int(matches[0, 0])
+
+
 def build_timestep_rows(
     layout: H3PackedLayout,
     *,
@@ -416,6 +440,8 @@ def build_timestep_rows(
     model_t_audio: float | torch.Tensor,
     visual_condition_clean: float = 0.999,
     audio_condition_clean: float = 1.0,
+    target_video_denoise_rows: torch.Tensor | None = None,
+    target_audio_denoise_rows: torch.Tensor | None = None,
 ) -> H3TimestepRows:
     video_time = _single_model_time(model_t_video, "video model time")
     audio_time = _single_model_time(model_t_audio, "audio model time")
@@ -440,15 +466,11 @@ def build_timestep_rows(
         else:
             segment_times[segment.role] = max(audio_time, audio_clean)
 
-    unique_values = sorted(set(segment_times.values()))
-    timestep_index = {value: index for index, value in enumerate(unique_values)}
     row_timesteps = torch.empty((1, layout.row_count), dtype=torch.float32)
-    row_timestep_indices = torch.empty((1, layout.row_count), dtype=torch.int64)
     token_tags = torch.empty((1, layout.row_count), dtype=torch.int64)
     for segment in layout.segments:
         value = segment_times[segment.role]
         row_timesteps[:, segment.row_slice] = value
-        row_timestep_indices[:, segment.row_slice] = timestep_index[value]
         if segment.kind == "text":
             token_tags[:, segment.row_slice] = text_token_tags
         elif segment.kind in {"visual_condition", "target_video"}:
@@ -456,18 +478,60 @@ def build_timestep_rows(
         else:
             token_tags[:, segment.row_slice] = 2
 
+    video_denoise_rows = _validate_target_denoise_rows(
+        target_video_denoise_rows,
+        layout.target_video_segment.row_count,
+        "target video denoise rows",
+    )
+    audio_denoise_rows = _validate_target_denoise_rows(
+        target_audio_denoise_rows,
+        layout.target_audio_segment.row_count,
+        "target audio denoise rows",
+    )
+    row_timesteps[:, layout.target_video_segment.row_slice] = torch.where(
+        video_denoise_rows,
+        torch.tensor(video_time, dtype=row_timesteps.dtype),
+        torch.tensor(1.0, dtype=row_timesteps.dtype),
+    )
+    row_timesteps[:, layout.target_audio_segment.row_slice] = torch.where(
+        audio_denoise_rows,
+        torch.tensor(audio_time, dtype=row_timesteps.dtype),
+        torch.tensor(1.0, dtype=row_timesteps.dtype),
+    )
+
+    unique_timesteps, row_timestep_indices = torch.unique(
+        row_timesteps,
+        sorted=True,
+        return_inverse=True,
+    )
+
     block_adaln_indices = 3 * row_timestep_indices + token_tags
     block_segments = tuple(_build_modulation_segments(indices) for indices in block_adaln_indices)
 
+    video_timestep_indices = row_timestep_indices[:, layout.target_video_segment.row_slice]
+    audio_timestep_indices = row_timestep_indices[:, layout.target_audio_segment.row_slice]
+
     return H3TimestepRows(
-        unique_timesteps=torch.tensor(unique_values, dtype=torch.float32),
+        unique_timesteps=unique_timesteps,
         row_timesteps=row_timesteps,
         row_timestep_indices=row_timestep_indices,
         token_tags=token_tags,
         block_adaln_indices=block_adaln_indices,
         block_segments=block_segments,
-        video_timestep_index=timestep_index[video_time],
-        audio_timestep_index=timestep_index[audio_time],
+        video_timestep_index=_timestep_index(
+            unique_timesteps,
+            video_time,
+            "target video",
+            fallback=int(video_timestep_indices[0, 0]),
+        ),
+        audio_timestep_index=_timestep_index(
+            unique_timesteps,
+            audio_time,
+            "target audio",
+            fallback=int(audio_timestep_indices[0, 0]),
+        ),
+        video_timestep_indices=video_timestep_indices,
+        audio_timestep_indices=audio_timestep_indices,
     )
 
 

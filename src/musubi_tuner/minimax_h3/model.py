@@ -442,13 +442,54 @@ class FinalLayer(nn.Module):
         audio_slice: slice,
         video_timestep_index: int,
         audio_timestep_index: int,
+        video_timestep_indices: torch.Tensor | None = None,
+        audio_timestep_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shift, scale = self.adaln_proj(timestep_embeddings)
         video = self.norm(hidden_states[:, video_slice])
-        video = video * (1.0 + scale[video_timestep_index]) + shift[video_timestep_index]
+        video = self._apply_timestep_modulation(
+            video,
+            shift,
+            scale,
+            timestep_index=video_timestep_index,
+            timestep_indices=video_timestep_indices,
+            label="video",
+        )
         audio = self.norm(hidden_states[:, audio_slice])
-        audio = audio * (1.0 + scale[audio_timestep_index]) + shift[audio_timestep_index]
+        audio = self._apply_timestep_modulation(
+            audio,
+            shift,
+            scale,
+            timestep_index=audio_timestep_index,
+            timestep_indices=audio_timestep_indices,
+            label="audio",
+        )
         return self.video_out(video.to(torch.float32)), self.audio_out(audio.to(torch.float32))
+
+    @staticmethod
+    def _apply_timestep_modulation(
+        hidden_states: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        *,
+        timestep_index: int,
+        timestep_indices: torch.Tensor | None,
+        label: str,
+    ) -> torch.Tensor:
+        if timestep_indices is None:
+            return hidden_states * (1.0 + scale[timestep_index]) + shift[timestep_index]
+        timestep_indices = torch.as_tensor(timestep_indices)
+        if timestep_indices.dtype != torch.int64 or timestep_indices.shape != hidden_states.shape[:2]:
+            raise ValueError(
+                f"MiniMax-H3 final {label} timestep indices must be int64 {tuple(hidden_states.shape[:2])}, "
+                f"got {timestep_indices.dtype} {tuple(timestep_indices.shape)}"
+            )
+        timestep_indices = timestep_indices.to(hidden_states.device)
+        if not torch.all((timestep_indices >= 0) & (timestep_indices < shift.shape[0])):
+            raise ValueError(f"MiniMax-H3 final {label} timestep indices are out of range")
+        row_shift = shift[timestep_indices]
+        row_scale = scale[timestep_indices]
+        return hidden_states * (1.0 + row_scale) + row_shift
 
 
 @dataclass(frozen=True)
@@ -671,6 +712,35 @@ class MiniMaxH3Model(nn.Module):
             rows.append(packed)
         return rows
 
+    @staticmethod
+    def _target_denoise_rows(
+        mask: torch.Tensor | None,
+        latents: torch.Tensor,
+        pack,
+        *,
+        label: str,
+    ) -> torch.Tensor | None:
+        if mask is None:
+            return None
+        mask = torch.as_tensor(mask, device=latents.device)
+        if mask.is_complex():
+            raise ValueError(f"MiniMax-H3 {label} must be real")
+        if mask.is_floating_point() and not torch.isfinite(mask).all():
+            raise ValueError(f"MiniMax-H3 {label} must be finite")
+        if not torch.all((mask == 0) | (mask == 1)):
+            raise ValueError(f"MiniMax-H3 {label} must contain only 0 (fixed) and 1 (regenerate)")
+        try:
+            mask = torch.broadcast_to(mask, latents.shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"MiniMax-H3 {label} shape {tuple(mask.shape)} is not broadcastable to {tuple(latents.shape)}"
+            ) from error
+        packed = pack(mask.to(torch.bool))
+        row_values = packed[..., :1]
+        if not torch.equal(packed, row_values.expand_as(packed)):
+            raise ValueError(f"MiniMax-H3 {label} must be constant within every packed target row")
+        return row_values[..., 0].detach().cpu()
+
     def forward(
         self,
         *,
@@ -685,6 +755,8 @@ class MiniMaxH3Model(nn.Module):
         audio_condition_latents: Sequence[torch.Tensor] = (),
         visual_condition_clean: float = 0.999,
         audio_condition_clean: float = 1.0,
+        video_denoise_mask: torch.Tensor | None = None,
+        audio_denoise_mask: torch.Tensor | None = None,
     ) -> MiniMaxH3Output:
         if video_latents.ndim != 5 or tuple(video_latents.shape[2:]) != (
             layout.target_video.frames,
@@ -715,6 +787,18 @@ class MiniMaxH3Model(nn.Module):
         text_hidden_states = text_hidden_states.to(execution_device)
         visual_condition_latents = tuple(tensor.to(execution_device) for tensor in visual_condition_latents)
         audio_condition_latents = tuple(tensor.to(execution_device) for tensor in audio_condition_latents)
+        video_denoise_rows = self._target_denoise_rows(
+            video_denoise_mask,
+            video_latents,
+            pack_video_rows,
+            label="video denoise mask",
+        )
+        audio_denoise_rows = self._target_denoise_rows(
+            audio_denoise_mask,
+            audio_latents,
+            pack_audio_rows,
+            label="audio denoise mask",
+        )
 
         visual_segments = tuple(segment for segment in layout.segments if segment.kind == "visual_condition")
         audio_segments = tuple(segment for segment in layout.segments if segment.kind == "audio_condition")
@@ -793,6 +877,8 @@ class MiniMaxH3Model(nn.Module):
             model_t_audio=model_t_audio,
             visual_condition_clean=visual_condition_clean,
             audio_condition_clean=audio_condition_clean,
+            target_video_denoise_rows=video_denoise_rows,
+            target_audio_denoise_rows=audio_denoise_rows,
         )
         timestep_embeddings = self.time_embedder(timestep_rows.unique_timesteps.to(execution_device)).to(self.dtype)
         rotation_table = self._cached_rotation_table(
@@ -827,14 +913,18 @@ class MiniMaxH3Model(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, index)
 
-        video_rows, audio_rows = self.final_layer(
-            hidden_states,
-            timestep_embeddings,
-            video_slice=layout.target_video_segment.row_slice,
-            audio_slice=layout.target_audio_segment.row_slice,
-            video_timestep_index=timestep_rows.video_timestep_index,
-            audio_timestep_index=timestep_rows.audio_timestep_index,
-        )
+        final_layer_kwargs = {
+            "video_slice": layout.target_video_segment.row_slice,
+            "audio_slice": layout.target_audio_segment.row_slice,
+            "video_timestep_index": timestep_rows.video_timestep_index,
+            "audio_timestep_index": timestep_rows.audio_timestep_index,
+        }
+        if video_denoise_rows is not None or audio_denoise_rows is not None:
+            final_layer_kwargs.update(
+                video_timestep_indices=timestep_rows.video_timestep_indices,
+                audio_timestep_indices=timestep_rows.audio_timestep_indices,
+            )
+        video_rows, audio_rows = self.final_layer(hidden_states, timestep_embeddings, **final_layer_kwargs)
         video, audio = unpack_targets(layout, video_rows, audio_rows)
         return MiniMaxH3Output(video=video.to(video_dtype), audio=audio.to(audio_dtype))
 

@@ -137,6 +137,41 @@ def augment_condition_latents(
     )
 
 
+def _prepare_retake_latents(
+    input_latents: torch.Tensor | None,
+    denoise_mask: torch.Tensor | None,
+    target_latents: torch.Tensor,
+    *,
+    label: str,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if (input_latents is None) != (denoise_mask is None):
+        raise ValueError(f"MiniMax-H3 {label} retake requires both input latents and a denoise mask")
+    if input_latents is None:
+        return None, None
+    input_latents = torch.as_tensor(input_latents)
+    if input_latents.shape != target_latents.shape:
+        raise ValueError(
+            f"MiniMax-H3 {label} retake input shape {tuple(input_latents.shape)} "
+            f"does not match target {tuple(target_latents.shape)}"
+        )
+    input_latents = input_latents.to(device=target_latents.device, dtype=target_latents.dtype)
+    denoise_mask = torch.as_tensor(denoise_mask, device=target_latents.device)
+    if denoise_mask.is_complex():
+        raise ValueError(f"MiniMax-H3 {label} denoise mask must be real")
+    if denoise_mask.is_floating_point() and not torch.isfinite(denoise_mask).all():
+        raise ValueError(f"MiniMax-H3 {label} denoise mask must be finite")
+    if not torch.all((denoise_mask == 0) | (denoise_mask == 1)):
+        raise ValueError(f"MiniMax-H3 {label} denoise mask must contain only 0 (fixed) and 1 (regenerate)")
+    try:
+        denoise_mask = torch.broadcast_to(denoise_mask, target_latents.shape)
+    except RuntimeError as error:
+        raise ValueError(
+            f"MiniMax-H3 {label} denoise mask shape {tuple(denoise_mask.shape)} "
+            f"is not broadcastable to {tuple(target_latents.shape)}"
+        ) from error
+    return input_latents, denoise_mask.to(torch.bool)
+
+
 @torch.no_grad()
 def sample_joint_av(
     transformer,
@@ -153,6 +188,10 @@ def sample_joint_av(
     audio_condition_latents: Sequence[torch.Tensor] = (),
     visual_condition_clean: float = 0.999,
     audio_condition_clean: float = 1.0,
+    input_video_latents: torch.Tensor | None = None,
+    video_denoise_mask: torch.Tensor | None = None,
+    input_audio_latents: torch.Tensor | None = None,
+    audio_denoise_mask: torch.Tensor | None = None,
     step_callback: Callable[[int, int], None] | None = None,
 ) -> H3SampleResult:
     if initial_video.ndim != 5 or tuple(initial_video.shape[2:]) != (
@@ -172,6 +211,19 @@ def sample_joint_av(
     if text_token_tags.shape != (initial_video.shape[0], layout.text_length):
         raise ValueError("MiniMax-H3 text token tags must preserve the [B,L] axes")
 
+    input_video_latents, video_denoise_mask = _prepare_retake_latents(
+        input_video_latents,
+        video_denoise_mask,
+        initial_video,
+        label="video",
+    )
+    input_audio_latents, audio_denoise_mask = _prepare_retake_latents(
+        input_audio_latents,
+        audio_denoise_mask,
+        initial_audio,
+        label="audio",
+    )
+
     schedule = build_shifted_schedule(
         steps,
         video_shift=video_shift,
@@ -183,9 +235,24 @@ def sample_joint_av(
     for index in range(steps):
         sigma_video = schedule.video[index].to(dtype=torch.float32)
         sigma_audio = schedule.audio[index].to(dtype=torch.float32)
+        model_video = (
+            video
+            if video_denoise_mask is None
+            else torch.where(video_denoise_mask, video, input_video_latents)
+        )
+        model_audio = (
+            audio
+            if audio_denoise_mask is None
+            else torch.where(audio_denoise_mask, audio, input_audio_latents)
+        )
+        retake_kwargs = {}
+        if video_denoise_mask is not None:
+            retake_kwargs["video_denoise_mask"] = video_denoise_mask
+        if audio_denoise_mask is not None:
+            retake_kwargs["audio_denoise_mask"] = audio_denoise_mask
         prediction = transformer(
-            video_latents=video,
-            audio_latents=audio,
+            video_latents=model_video,
+            audio_latents=model_audio,
             text_hidden_states=text_hidden_states,
             text_token_tags=text_token_tags,
             layout=layout,
@@ -195,13 +262,22 @@ def sample_joint_av(
             audio_condition_latents=audio_condition_latents,
             visual_condition_clean=visual_condition_clean,
             audio_condition_clean=audio_condition_clean,
+            **retake_kwargs,
         )
         if prediction.video.shape != video.shape or prediction.audio.shape != audio.shape:
             raise ValueError("MiniMax-H3 transformer predictions do not match the target latent shapes")
+        prediction_video = prediction.video
+        prediction_audio = prediction.audio
+        if video_denoise_mask is not None:
+            fixed_prediction = (input_video_latents - video) / sigma_video.to(video)
+            prediction_video = torch.where(video_denoise_mask, prediction_video, fixed_prediction)
+        if audio_denoise_mask is not None:
+            fixed_prediction = (input_audio_latents - audio) / sigma_audio.to(audio)
+            prediction_audio = torch.where(audio_denoise_mask, prediction_audio, fixed_prediction)
         video_delta = (schedule.video[index] - schedule.video[index + 1]).to(video)
         audio_delta = (schedule.audio[index] - schedule.audio[index + 1]).to(audio)
-        video = video + video_delta * prediction.video
-        audio = audio + audio_delta * prediction.audio
+        video = video + video_delta * prediction_video
+        audio = audio + audio_delta * prediction_audio
         if step_callback is not None:
             step_callback(index + 1, steps)
     return H3SampleResult(video=video, audio=audio)
